@@ -1,0 +1,3 @@
+- insert:
+  - id: dsh-fofa-plugin
+    name: ./scratch-plugin/src/fofa-plugin.ts
