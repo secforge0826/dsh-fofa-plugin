@@ -2,28 +2,27 @@
  * scratch-plugin/src/fofa-plugin.ts
  *
  * DeepSeek Harness (Cordis) plugin for FOFA (fofa.info).
- * - Uses undici.fetch for Node compatibility
- * - Exports default plugin object (name/inject/apply) per Cordis conventions
- * - Exposes `searchFOFA` helper so other JS/AI agents can import and call directly
- * - Registers a tool `fofa.search` with rich JSON Schema for AI tool-calling
+ * - Compatible with Node and DSH agent environments
+ * - Uses global fetch if available, otherwise undici.fetch
+ * - Exports searchFOFA, searchFOFASummary, buildFofaQuery helpers
+ * - Exports default Cordis plugin object (name/inject/apply) with tool registration
+ *
+ * FOFA query helper (buildFofaQuery) accepts either a FOFA DSL string
+ * or an object of filters, e.g. { app: 'nginx', domain: 'example.com' }
+ * which gets translated to: 'app="nginx" && domain="example.com"'
  *
  * Security:
  *   - Credentials may come from: args > ctx.config.fofa > environment (FOFA_EMAIL/FOFA_KEY)
- *
- * Usage (as plugin):
- *   // cordis overlay should reference this file
- *   tools.call('fofa.search', { query: 'app=nginx', pages: 2, size: 100 })
- *
- * Usage (direct import by AI/agent code):
- *   import { searchFOFA } from './scratch-plugin/src/fofa-plugin';
- *   const res = await searchFOFA({ query: 'app=nginx', pages: 1 }, { email: 'x', key: 'y' });
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { fetch } from 'undici';
+import { fetch as undiciFetch } from 'undici';
 
 export const name = 'dsh-fofa-plugin';
 export const inject = ['tools'];
+
+// Use global fetch if present, otherwise undici
+const _fetch: typeof fetch = (globalThis as any).fetch ?? undiciFetch as any;
 
 export interface FOFAQueryOptions {
   query: string;
@@ -33,11 +32,10 @@ export interface FOFAQueryOptions {
   key?: string;
   url?: string;
   sleepMs?: number; // ms between page requests
-  concurrency?: number; // currently unused, reserved for future
+  concurrency?: number; // reserved for future
 }
 
 export interface FOFAResultItem {
-  // dynamic mapping of FOFA fields -> values
   [key: string]: any;
   _raw_result?: any;
   _fofa_fields?: string[];
@@ -54,10 +52,44 @@ export interface FOFAResult {
   };
 }
 
-// Helper that performs FOFA search and returns normalized results.
+/**
+ * Build a FOFA query string from either a string or an object of filters.
+ * If `filters` is a string, it's returned unchanged. If it's an object,
+ * keys and values are mapped to key="value" and joined with ' && '.
+ *
+ * Example:
+ *  buildFofaQuery({ app: 'nginx', domain: 'example.com' })
+ *  -> 'app="nginx" && domain="example.com"'
+ */
+export function buildFofaQuery(filters: string | Record<string, string | number | boolean>): string {
+  if (typeof filters === 'string') return filters;
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(filters)) {
+    if (v === null || v === undefined) continue;
+    const safe = String(v).replace(/"/g, '\\"');
+    // If value contains spaces or special chars we keep quoting
+    parts.push(`${k}="${safe}"`);
+  }
+  return parts.join(' && ');
+}
+
+// Helper: short textual summary for LLM / AI consumption
+export function summarizeResults(items: FOFAResultItem[], topN = 5): string {
+  const take = items.slice(0, topN);
+  const lines = take.map((it, idx) => {
+    // Try common fields
+    const host = it.host || it.ip || it.domain || it.value || '';
+    const port = it.port ? `:${it.port}` : '';
+    const app = it.app || it.service || '';
+    const title = it.title ? ` title="${it.title}"` : '';
+    return `${idx + 1}. ${host}${port}${app ? ` (${app})` : ''}${title}`.trim();
+  });
+  return `Top ${Math.min(topN, items.length)} assets:\n` + lines.join('\n');
+}
+
+// core search function
 export async function searchFOFA(
   opts: FOFAQueryOptions,
-  // optional credentials/config override: { email, key, url }
   overrideConfig?: { email?: string; key?: string; url?: string },
 ): Promise<FOFAResult> {
   const query = opts.query;
@@ -73,14 +105,12 @@ export async function searchFOFA(
     throw new Error('FOFA credentials missing: provide email/key in args, overrideConfig, or set FOFA_EMAIL/FOFA_KEY');
   }
 
-  // base64 encode helper
   const qbase64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
 
   const items: FOFAResultItem[] = [];
   let fetchedPages = 0;
   let totalEstimate: number | null = null;
 
-  // Retry/backoff parameters
   const maxAttempts = 3;
   const baseBackoffMs = 500;
 
@@ -98,11 +128,10 @@ export async function searchFOFA(
           size: String(size),
         });
         const url = `${baseUrl}?${params.toString()}`;
-        const resp = await fetch(url, { method: 'GET' });
+        const resp = await _fetch(url, { method: 'GET' } as any);
         if (!resp.ok) {
           const text = await resp.text();
           const errMsg = `FOFA HTTP ${resp.status} ${resp.statusText}: ${text}`;
-          // retry on 429 or 5xx
           if (resp.status === 429 || resp.status >= 500) {
             lastError = new Error(errMsg);
             const backoff = baseBackoffMs * Math.pow(2, attempt - 1);
@@ -147,19 +176,15 @@ export async function searchFOFA(
         }
 
         fetchedPages += 1;
-        break; // success for this page
+        break;
       } catch (err) {
         lastError = err;
-        // simple logging to stdout/stderr; callers may wrap
-        // but keep library agnostic (no ctx.logger here)
-        // retry after backoff
         const backoff = baseBackoffMs * Math.pow(2, attempt - 1);
         await new Promise((r) => setTimeout(r, backoff));
       }
     }
 
     if (lastError && page === 1 && fetchedPages === 0) {
-      // give up early if first page fails after retries
       throw lastError;
     }
 
@@ -179,8 +204,14 @@ export async function searchFOFA(
   };
 }
 
-// Default export in Cordis object form. This is the form accepted by
-// deepseek-harness docs: a module exporting name / inject / apply.
+// Convenience: return both structured results and a short textual summary.
+export async function searchFOFASummary(opts: FOFAQueryOptions, overrideConfig?: { email?: string; key?: string; url?: string }) {
+  const res = await searchFOFA(opts, overrideConfig);
+  const summary = summarizeResults(res.items, 5);
+  return { ...res, summary };
+}
+
+// Cordis plugin export
 export default {
   name,
   inject,
@@ -190,8 +221,6 @@ export default {
 
     const toolId = 'fofa.search';
 
-    // Tool input/output schema aims to be AI-friendly so language agents
-    // can call it using tool-calling with structured arguments.
     tools?.register?.({
       id: toolId,
       name: 'FOFA Search',
@@ -215,6 +244,7 @@ export default {
           properties: {
             items: { type: 'array' },
             meta: { type: 'object' },
+            summary: { type: 'string' },
           },
         },
       },
@@ -229,7 +259,6 @@ export default {
           sleepMs: args.sleepMs ?? 1000,
         };
 
-        // allow ctx.config.fofa to supply defaults
         const override = {
           email: (ctx as any).config?.fofa?.email,
           key: (ctx as any).config?.fofa?.key,
@@ -237,7 +266,7 @@ export default {
         };
 
         try {
-          const res = await searchFOFA(opts, override);
+          const res = await searchFOFASummary(opts, override);
           return res;
         } catch (e: any) {
           logger.error?.('[dsh-fofa-plugin] FOFA search failed:', e?.message ?? String(e));
