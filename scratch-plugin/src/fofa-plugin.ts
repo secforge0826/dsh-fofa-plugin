@@ -53,24 +53,151 @@ export interface FOFAResult {
 }
 
 /**
- * Build a FOFA query string from either a string or an object of filters.
- * If `filters` is a string, it's returned unchanged. If it's an object,
- * keys and values are mapped to key="value" and joined with ' && '.
+ * buildFofaQuery - 将结构化描述或字符串转换为 FOFA DSL 字符串
  *
- * Example:
- *  buildFofaQuery({ app: 'nginx', domain: 'example.com' })
- *  -> 'app="nginx" && domain="example.com"'
+ * 支持输入：
+ *  - 字符串（直接返回）
+ *  - 对象：
+ *      { _and: [ ... ] } / { _or: [ ... ] } / { _not: expr }
+ *      { field: value }  // value 可为 string | number | boolean | array | { op, value } | { after, before } | { func, expr | args }
+ *
+ * 示例：
+ *  buildFofaQuery({ app: 'nginx', domain: ['a.com','b.com'] })
+ *   => 'app="nginx" && (domain="a.com" || domain="b.com")'
+ *
+ *  buildFofaQuery({ _or: [ { ip: '1.1.1.1' }, { domain: 'example.com' } ] })
+ *   => '(ip="1.1.1.1" || domain="example.com")'
  */
-export function buildFofaQuery(filters: string | Record<string, string | number | boolean>): string {
-  if (typeof filters === 'string') return filters;
-  const parts: string[] = [];
-  for (const [k, v] of Object.entries(filters)) {
-    if (v === null || v === undefined) continue;
-    const safe = String(v).replace(/"/g, '\\"');
-    // If value contains spaces or special chars we keep quoting
-    parts.push(`${k}="${safe}"`);
+export function buildFofaQuery(input: string | any): string {
+  if (typeof input === 'string') return input.trim();
+
+  function quoteVal(v: any): string {
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    if (typeof v === 'number') return String(v);
+    // Escape double quotes inside value
+    return `"${String(v).replace(/"/g, '\\"')}"`;
   }
-  return parts.join(' && ');
+
+  function opToSymbol(op: string): string {
+    switch (op) {
+      case 'eq': case '=': return '=';
+      case 'exact': case '==': return '==';
+      case 'neq': case '!=': return '!=';
+      case 'like': case '*=': return '*=';
+      default: return op; // allow direct symbols if provided
+    }
+  }
+
+  function buildFieldExpr(field: string, val: any): string {
+    // If val is primitive
+    if (val === null || val === undefined) {
+      return `${field}=""`;
+    }
+    if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+      if (typeof val === 'boolean') return `${field}=${val ? 'true' : 'false'}`;
+      if (typeof val === 'number') return `${field}=${val}`;
+      return `${field}=${quoteVal(val)}`;
+    }
+
+    // Array => OR of values
+    if (Array.isArray(val)) {
+      const parts = val.map(v => buildFieldExpr(field, v));
+      return `(${parts.join(' || ')})`;
+    }
+
+    // Object: might be {op, value} or {after,before} or function descriptor
+    if (typeof val === 'object') {
+      // function form: { func: 'ip_filter', expr: 'banner="SSH-..."' } or { func: 'ip_filter', args: ['banner="..."', 'icon_hash="..."'] }
+      if (val.func) {
+        const fn = String(val.func);
+        if (typeof val.expr === 'string') {
+          return `${fn}(${val.expr})`;
+        }
+        if (Array.isArray(val.args)) {
+          // produce fn(arg) && fn(arg2) ...
+          return val.args.map((a: any) => `${fn}(${typeof a === 'string' ? a : buildFofaQuery(a)})`).join(' && ');
+        }
+        // fallback: pass object fields as exprs joined with ' && '
+        const argExprs: string[] = [];
+        for (const [k, v] of Object.entries(val)) {
+          if (k === 'func') continue;
+          if (k === 'expr' || k === 'args') continue;
+          argExprs.push(buildFieldExpr(String(k), v));
+        }
+        return `${fn}(${argExprs.join(' && ')})`;
+      }
+
+      // range / time style: { after: '2023-01-01', before: '2023-12-01' }
+      if ('after' in val || 'before' in val) {
+        const parts: string[] = [];
+        if ('after' in val) parts.push(`${field}.after=${quoteVal(val.after)}`);
+        if ('before' in val) parts.push(`${field}.before=${quoteVal(val.before)}`);
+        return parts.join(' && ');
+      }
+
+      // operator form: { op: '==', value: 'x' } or { op: 'like', value: 'v*' }
+      if ('op' in val && 'value' in val) {
+        const sym = opToSymbol(String(val.op));
+        const v = val.value;
+        if (typeof v === 'boolean' || typeof v === 'number') {
+          return `${field}${sym}${v}`;
+        }
+        return `${field}${sym}${quoteVal(v)}`;
+      }
+
+      // Nested object where keys are subfields (support cert.not_after.after via nested)
+      const nestedParts: string[] = [];
+      for (const [subk, subv] of Object.entries(val)) {
+        const dotted = `${field}.${subk}`;
+        nestedParts.push(buildFieldExpr(dotted, subv));
+      }
+      return nestedParts.join(' && ');
+    }
+
+    // fallback
+    return `${field}=${quoteVal(String(val))}`;
+  }
+
+  function buildFromObj(obj: any): string {
+    if (obj === null || obj === undefined) return '';
+
+    // boolean operators keys: _and, _or, _not
+    if (typeof obj === 'object' && !Array.isArray(obj)) {
+      if ('_and' in obj) {
+        const arr = Array.isArray(obj._and) ? obj._and : [obj._and];
+        const parts = arr.map((e: any) => typeof e === 'string' ? e : buildFromObj(e)).filter(Boolean);
+        return parts.length > 1 ? `(${parts.join(' && ')})` : parts[0] ?? '';
+      }
+      if ('_or' in obj) {
+        const arr = Array.isArray(obj._or) ? obj._or : [obj._or];
+        const parts = arr.map((e: any) => typeof e === 'string' ? e : buildFromObj(e)).filter(Boolean);
+        return parts.length > 1 ? `(${parts.join(' || ')})` : parts[0] ?? '';
+      }
+      if ('_not' in obj) {
+        const e = obj._not;
+        const inner = typeof e === 'string' ? e : buildFromObj(e);
+        return `!(${inner})`;
+      }
+
+      const parts: string[] = [];
+      for (const [k, v] of Object.entries(obj)) {
+        if (!k) continue;
+        parts.push(buildFieldExpr(k, v));
+      }
+      if (parts.length === 0) return '';
+      if (parts.length === 1) return parts[0];
+      return `(${parts.join(' && ')})`;
+    }
+
+    if (Array.isArray(obj)) {
+      const parts = obj.map(e => (typeof e === 'string' ? e : buildFromObj(e))).filter(Boolean);
+      return parts.length > 1 ? `(${parts.join(' || ')})` : parts[0] ?? '';
+    }
+
+    return String(obj);
+  }
+
+  return buildFromObj(input).trim();
 }
 
 // Helper: short textual summary for LLM / AI consumption
