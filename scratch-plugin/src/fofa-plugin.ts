@@ -3,26 +3,40 @@
  *
  * DeepSeek Harness (Cordis) plugin for FOFA (fofa.info).
  * - Compatible with Node and DSH agent environments
- * - Uses global fetch if available, otherwise undici.fetch
+ * - Resolves fetch at runtime (global fetch preferred, otherwise tries dynamic import of undici)
  * - Exports searchFOFA, searchFOFASummary, buildFofaQuery helpers
  * - Exports default Cordis plugin object (name/inject/apply) with tool registration
  *
- * FOFA query helper (buildFofaQuery) accepts either a FOFA DSL string
- * or an object of filters, e.g. { app: 'nginx', domain: 'example.com' }
- * which gets translated to: 'app="nginx" && domain="example.com"'
- *
- * Security:
- *   - Credentials may come from: args > ctx.config.fofa > environment (FOFA_EMAIL/FOFA_KEY)
+ * NOTE: This file intentionally avoids top-level imports that can throw when the
+ * host environment doesn't have optional dependencies installed. That prevents
+ * plugin loading from crashing DeepSeek Harness if undici is not available.
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { fetch as undiciFetch } from 'undici';
 
 export const name = 'dsh-fofa-plugin';
 export const inject = ['tools'];
 
-// Use global fetch if present, otherwise undici
-const _fetch: typeof fetch = (globalThis as any).fetch ?? undiciFetch as any;
+let _fetchFn: typeof fetch | null = null;
+async function getFetch(): Promise<typeof fetch> {
+  if (_fetchFn) return _fetchFn;
+  if (typeof (globalThis as any).fetch === 'function') {
+    _fetchFn = (globalThis as any).fetch.bind(globalThis);
+    return _fetchFn;
+  }
+  // try dynamic import of undici; if unavailable, return descriptive error
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const undici = await import('undici');
+    if (undici && typeof undici.fetch === 'function') {
+      _fetchFn = undici.fetch as any;
+      return _fetchFn;
+    }
+  } catch (e) {
+    // ignore - will throw below
+  }
+  throw new Error('No fetch available in runtime. Use Node 18+ or install the dependency "undici" in the host environment.');
+}
 
 export interface FOFAQueryOptions {
   query: string;
@@ -54,19 +68,6 @@ export interface FOFAResult {
 
 /**
  * buildFofaQuery - 将结构化描述或字符串转换为 FOFA DSL 字符串
- *
- * 支持输入：
- *  - 字符串（直接返回）
- *  - 对象：
- *      { _and: [ ... ] } / { _or: [ ... ] } / { _not: expr }
- *      { field: value }  // value 可为 string | number | boolean | array | { op, value } | { after, before } | { func, expr | args }
- *
- * 示例：
- *  buildFofaQuery({ app: 'nginx', domain: ['a.com','b.com'] })
- *   => 'app="nginx" && (domain="a.com" || domain="b.com")'
- *
- *  buildFofaQuery({ _or: [ { ip: '1.1.1.1' }, { domain: 'example.com' } ] })
- *   => '(ip="1.1.1.1" || domain="example.com")'
  */
 export function buildFofaQuery(input: string | any): string {
   if (typeof input === 'string') return input.trim();
@@ -74,7 +75,6 @@ export function buildFofaQuery(input: string | any): string {
   function quoteVal(v: any): string {
     if (typeof v === 'boolean') return v ? 'true' : 'false';
     if (typeof v === 'number') return String(v);
-    // Escape double quotes inside value
     return `"${String(v).replace(/"/g, '\\"')}"`;
   }
 
@@ -89,7 +89,6 @@ export function buildFofaQuery(input: string | any): string {
   }
 
   function buildFieldExpr(field: string, val: any): string {
-    // If val is primitive
     if (val === null || val === undefined) {
       return `${field}=""`;
     }
@@ -99,25 +98,20 @@ export function buildFofaQuery(input: string | any): string {
       return `${field}=${quoteVal(val)}`;
     }
 
-    // Array => OR of values
     if (Array.isArray(val)) {
       const parts = val.map(v => buildFieldExpr(field, v));
       return `(${parts.join(' || ')})`;
     }
 
-    // Object: might be {op, value} or {after,before} or function descriptor
     if (typeof val === 'object') {
-      // function form: { func: 'ip_filter', expr: 'banner="SSH-..."' } or { func: 'ip_filter', args: ['banner="..."', 'icon_hash="..."'] }
-      if (val.func) {
-        const fn = String(val.func);
-        if (typeof val.expr === 'string') {
-          return `${fn}(${val.expr})`;
+      if ((val as any).func) {
+        const fn = String((val as any).func);
+        if (typeof (val as any).expr === 'string') {
+          return `${fn}(${(val as any).expr})`;
         }
-        if (Array.isArray(val.args)) {
-          // produce fn(arg) && fn(arg2) ...
-          return val.args.map((a: any) => `${fn}(${typeof a === 'string' ? a : buildFofaQuery(a)})`).join(' && ');
+        if (Array.isArray((val as any).args)) {
+          return (val as any).args.map((a: any) => `${fn}(${typeof a === 'string' ? a : buildFofaQuery(a)})`).join(' && ');
         }
-        // fallback: pass object fields as exprs joined with ' && '
         const argExprs: string[] = [];
         for (const [k, v] of Object.entries(val)) {
           if (k === 'func') continue;
@@ -127,7 +121,6 @@ export function buildFofaQuery(input: string | any): string {
         return `${fn}(${argExprs.join(' && ')})`;
       }
 
-      // range / time style: { after: '2023-01-01', before: '2023-12-01' }
       if ('after' in val || 'before' in val) {
         const parts: string[] = [];
         if ('after' in val) parts.push(`${field}.after=${quoteVal(val.after)}`);
@@ -135,17 +128,15 @@ export function buildFofaQuery(input: string | any): string {
         return parts.join(' && ');
       }
 
-      // operator form: { op: '==', value: 'x' } or { op: 'like', value: 'v*' }
       if ('op' in val && 'value' in val) {
-        const sym = opToSymbol(String(val.op));
-        const v = val.value;
+        const sym = opToSymbol(String((val as any).op));
+        const v = (val as any).value;
         if (typeof v === 'boolean' || typeof v === 'number') {
           return `${field}${sym}${v}`;
         }
         return `${field}${sym}${quoteVal(v)}`;
       }
 
-      // Nested object where keys are subfields (support cert.not_after.after via nested)
       const nestedParts: string[] = [];
       for (const [subk, subv] of Object.entries(val)) {
         const dotted = `${field}.${subk}`;
@@ -154,14 +145,12 @@ export function buildFofaQuery(input: string | any): string {
       return nestedParts.join(' && ');
     }
 
-    // fallback
     return `${field}=${quoteVal(String(val))}`;
   }
 
   function buildFromObj(obj: any): string {
     if (obj === null || obj === undefined) return '';
 
-    // boolean operators keys: _and, _or, _not
     if (typeof obj === 'object' && !Array.isArray(obj)) {
       if ('_and' in obj) {
         const arr = Array.isArray(obj._and) ? obj._and : [obj._and];
@@ -204,7 +193,6 @@ export function buildFofaQuery(input: string | any): string {
 export function summarizeResults(items: FOFAResultItem[], topN = 5): string {
   const take = items.slice(0, topN);
   const lines = take.map((it, idx) => {
-    // Try common fields
     const host = it.host || it.ip || it.domain || it.value || '';
     const port = it.port ? `:${it.port}` : '';
     const app = it.app || it.service || '';
@@ -255,7 +243,8 @@ export async function searchFOFA(
           size: String(size),
         });
         const url = `${baseUrl}?${params.toString()}`;
-        const resp = await _fetch(url, { method: 'GET' } as any);
+        const fetchFn = await getFetch();
+        const resp = await fetchFn(url, { method: 'GET' } as any);
         if (!resp.ok) {
           const text = await resp.text();
           const errMsg = `FOFA HTTP ${resp.status} ${resp.statusText}: ${text}`;
@@ -348,59 +337,64 @@ export default {
 
     const toolId = 'fofa.search';
 
-    tools?.register?.({
-      id: toolId,
-      name: 'FOFA Search',
-      description: 'Search FOFA (fofa.info) for network assets using FOFA DSL. Returns normalized items and metadata.',
-      schema: {
-        input: {
-          type: 'object',
-          properties: {
-            query: { type: 'string', description: "FOFA query (e.g. 'app=nginx')" },
-            pages: { type: 'integer', minimum: 1, description: 'Number of pages to fetch (default 1)' },
-            size: { type: 'integer', minimum: 1, description: 'Page size (default 100)' },
-            email: { type: 'string', description: 'FOFA email (overrides environment/config)' },
-            key: { type: 'string', description: 'FOFA API key (overrides environment/config)' },
-            url: { type: 'string', description: 'FOFA API URL (optional)' },
-            sleepMs: { type: 'integer', description: 'Delay between page requests in ms (default 1000)' },
+    try {
+      tools?.register?.({
+        id: toolId,
+        name: 'FOFA Search',
+        description: 'Search FOFA (fofa.info) for network assets using FOFA DSL. Returns normalized items and metadata.',
+        schema: {
+          input: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: "FOFA query (e.g. 'app=nginx')" },
+              pages: { type: 'integer', minimum: 1, description: 'Number of pages to fetch (default 1)' },
+              size: { type: 'integer', minimum: 1, description: 'Page size (default 100)' },
+              email: { type: 'string', description: 'FOFA email (overrides environment/config)' },
+              key: { type: 'string', description: 'FOFA API key (overrides environment/config)' },
+              url: { type: 'string', description: 'FOFA API URL (optional)' },
+              sleepMs: { type: 'integer', description: 'Delay between page requests in ms (default 1000)' },
+            },
+            required: ['query'],
           },
-          required: ['query'],
-        },
-        output: {
-          type: 'object',
-          properties: {
-            items: { type: 'array' },
-            meta: { type: 'object' },
-            summary: { type: 'string' },
+          output: {
+            type: 'object',
+            properties: {
+              items: { type: 'array' },
+              meta: { type: 'object' },
+              summary: { type: 'string' },
+            },
           },
         },
-      },
-      run: async (args: any = {}) => {
-        const opts: FOFAQueryOptions = {
-          query: String(args.query),
-          pages: args.pages ?? 1,
-          size: args.size ?? 100,
-          email: args.email,
-          key: args.key,
-          url: args.url,
-          sleepMs: args.sleepMs ?? 1000,
-        };
+        run: async (args: any = {}) => {
+          const opts: FOFAQueryOptions = {
+            query: String(args.query),
+            pages: args.pages ?? 1,
+            size: args.size ?? 100,
+            email: args.email,
+            key: args.key,
+            url: args.url,
+            sleepMs: args.sleepMs ?? 1000,
+          };
 
-        const override = {
-          email: (ctx as any).config?.fofa?.email,
-          key: (ctx as any).config?.fofa?.key,
-          url: (ctx as any).config?.fofa?.url,
-        };
+          const override = {
+            email: (ctx as any).config?.fofa?.email,
+            key: (ctx as any).config?.fofa?.key,
+            url: (ctx as any).config?.fofa?.url,
+          };
 
-        try {
-          const res = await searchFOFASummary(opts, override);
-          return res;
-        } catch (e: any) {
-          logger.error?.('[dsh-fofa-plugin] FOFA search failed:', e?.message ?? String(e));
-          throw e;
-        }
-      },
-    });
+          try {
+            const res = await searchFOFASummary(opts, override);
+            return res;
+          } catch (e: any) {
+            logger.error?.('[dsh-fofa-plugin] FOFA search failed:', e?.message ?? String(e));
+            throw e;
+          }
+        },
+      });
+    } catch (e) {
+      // Fail safe: do not throw during plugin registration to avoid crashing host.
+      logger.error?.('[dsh-fofa-plugin] failed to register tool', e?.message ?? String(e));
+    }
 
     ctx.effect?.(() => {
       return () => {
